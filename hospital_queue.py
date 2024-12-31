@@ -1,172 +1,194 @@
-# hospital_queue_simulation.py
 
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy.stats import poisson
 from datetime import datetime, timedelta
+import time
+from typing import List, Dict, Optional
+import threading
+import queue
+import tkinter as tk
+from tkinter import ttk
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
-class HospitalQueueSimulation:
-    def __init__(self, avg_arrival_rate, avg_service_rate, num_hours=8):
-        """
-        Initialize simulation parameters
+class Patient:
+    def __init__(self, id: int, arrival_time: datetime, priority: int = 1):
+        self.id = id
+        self.arrival_time = arrival_time
+        self.service_start_time: Optional[datetime] = None
+        self.service_end_time: Optional[datetime] = None
+        self.priority = priority  # 1 = normal, 2 = urgent, 3 = emergency
+        self.service_duration: Optional[int] = None
 
-        Args:
-            avg_arrival_rate: Average number of patients arriving per hour
-            avg_service_rate: Average number of patients that can be served per hour
-            num_hours: Number of hours to simulate
-        """
-        self.avg_arrival_rate = avg_arrival_rate
+
+class InteractiveHospitalQueue:
+    def __init__(self, avg_service_rate: float = 4):
         self.avg_service_rate = avg_service_rate
-        self.num_hours = num_hours
+        self.queue = queue.PriorityQueue()
+        self.current_patient: Optional[Patient] = None
+        self.completed_patients: List[Patient] = []
+        self.patient_counter = 0
+        self.is_running = False
+        self.service_thread = None
+        self.update_thread = None
 
-    def generate_arrivals(self):
-        """Generate random patient arrivals using Poisson distribution"""
-        arrivals = poisson.rvs(mu=self.avg_arrival_rate, size=self.num_hours)
-        return arrivals
+        # Create main window
+        self.root = tk.Tk()
+        self.root.title("Interactive Hospital Queue Simulation")
+        self.setup_gui()
 
-    def generate_service_times(self, total_patients):
-        """Generate random service times using Poisson distribution"""
-        service_times = poisson.rvs(mu=60 / self.avg_service_rate, size=total_patients)
-        return service_times  # in minutes
+    def setup_gui(self):
+        # Create frames
+        control_frame = ttk.Frame(self.root, padding="10")
+        control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-    def run_simulation(self):
-        """Run the queue simulation"""
-        # Generate arrivals for each hour
-        hourly_arrivals = self.generate_arrivals()
-        total_patients = sum(hourly_arrivals)
+        stats_frame = ttk.Frame(self.root, padding="10")
+        stats_frame.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        # Generate arrival times throughout the day
-        arrival_times = []
-        current_time = datetime.strptime('08:00', '%H:%M')  # Start at 8 AM
+        queue_frame = ttk.Frame(self.root, padding="10")
+        queue_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        for hour, num_arrivals in enumerate(hourly_arrivals):
-            if num_arrivals > 0:
-                # Distribute arrivals randomly within the hour
-                minute_offsets = np.random.uniform(0, 60, num_arrivals)
-                for offset in minute_offsets:
-                    arrival_time = current_time + timedelta(hours=hour, minutes=offset)
-                    arrival_times.append(arrival_time)
+        # Control buttons
+        ttk.Button(control_frame, text="Add Normal Patient",
+                   command=lambda: self.add_patient(1)).grid(row=0, column=0, pady=5)
+        ttk.Button(control_frame, text="Add Urgent Patient",
+                   command=lambda: self.add_patient(2)).grid(row=1, column=0, pady=5)
+        ttk.Button(control_frame, text="Add Emergency Patient",
+                   command=lambda: self.add_patient(3)).grid(row=2, column=0, pady=5)
 
-        # Sort arrival times
-        arrival_times.sort()
+        self.start_stop_button = ttk.Button(control_frame, text="Start Service",
+                                            command=self.toggle_service)
+        self.start_stop_button.grid(row=3, column=0, pady=5)
 
-        # Generate service times
-        service_times = self.generate_service_times(total_patients)
+        # Statistics labels
+        self.stats_labels = {}
+        stats = ["Patients in Queue:", "Current Patient:", "Average Wait Time:",
+                 "Max Wait Time:", "Completed Patients:"]
+        for i, stat in enumerate(stats):
+            ttk.Label(stats_frame, text=stat).grid(row=i, column=0, sticky=tk.W, pady=2)
+            self.stats_labels[stat] = ttk.Label(stats_frame, text="0")
+            self.stats_labels[stat].grid(row=i, column=1, sticky=tk.W, pady=2)
 
-        # Calculate waiting times and queue lengths
-        waiting_times = []
-        queue_lengths = []
-        service_start_times = []
-        current_queue = 0
-        last_service_end = arrival_times[0]
+        # Queue display
+        self.queue_tree = ttk.Treeview(queue_frame, columns=("ID", "Wait Time", "Priority"),
+                                       show="headings")
+        self.queue_tree.heading("ID", text="Patient ID")
+        self.queue_tree.heading("Wait Time", text="Wait Time (min)")
+        self.queue_tree.heading("Priority", text="Priority")
+        self.queue_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        for i in range(len(arrival_times)):
-            arrival = arrival_times[i]
-            service_time = service_times[i]
+        # Scrollbar for queue display
+        scrollbar = ttk.Scrollbar(queue_frame, orient=tk.VERTICAL, command=self.queue_tree.yview)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.queue_tree.configure(yscrollcommand=scrollbar.set)
 
-            # Update service start time
-            service_start = max(arrival, last_service_end)
-            service_start_times.append(service_start)
+        # Setup plotting
+        self.fig = Figure(figsize=(8, 4))
+        self.ax = self.fig.add_subplot(111)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().grid(row=2, column=0, columnspan=2, padx=10, pady=10)
 
-            # Calculate waiting time
-            waiting_time = (service_start - arrival).total_seconds() / 60  # in minutes
-            waiting_times.append(waiting_time)
+    def add_patient(self, priority: int):
+        self.patient_counter += 1
+        patient = Patient(
+            id=self.patient_counter,
+            arrival_time=datetime.now(),
+            priority=priority
+        )
+        # Priority queue uses tuples of (priority, arrival_time, patient)
+        # Negating priority ensures higher priority (3) comes before lower priority (1)
+        self.queue.put((-priority, patient.arrival_time.timestamp(), patient))
+        self.update_display()
 
-            # Update last service end time
-            last_service_end = service_start + timedelta(minutes=service_time)
+    def toggle_service(self):
+        if not self.is_running:
+            self.is_running = True
+            self.start_stop_button.configure(text="Stop Service")
+            self.service_thread = threading.Thread(target=self.run_service)
+            self.update_thread = threading.Thread(target=self.update_display_loop)
+            self.service_thread.daemon = True
+            self.update_thread.daemon = True
+            self.service_thread.start()
+            self.update_thread.start()
+        else:
+            self.is_running = False
+            self.start_stop_button.configure(text="Start Service")
 
-            # Update queue length
-            current_queue = sum(1 for j in range(i + 1, len(arrival_times))
-                                if arrival_times[j] <= service_start)
-            queue_lengths.append(current_queue)
+    def run_service(self):
+        while self.is_running:
+            if self.current_patient is None and not self.queue.empty():
+                _, _, patient = self.queue.get()
+                self.current_patient = patient
+                self.current_patient.service_start_time = datetime.now()
+                self.current_patient.service_duration = int(poisson.rvs(mu=60 / self.avg_service_rate))
+                time.sleep(self.current_patient.service_duration)
+                self.current_patient.service_end_time = datetime.now()
+                self.completed_patients.append(self.current_patient)
+                self.current_patient = None
+            time.sleep(0.1)
 
-        # Create DataFrame with results
-        self.results = pd.DataFrame({
-            'arrival_time': arrival_times,
-            'service_start': service_start_times,
-            'service_duration': service_times,
-            'waiting_time': waiting_times,
-            'queue_length': queue_lengths
-        })
+    def update_display_loop(self):
+        while self.is_running:
+            self.update_display()
+            time.sleep(1)
 
-        return self.results
+    def update_display(self):
+        # Clear queue display
+        for item in self.queue_tree.get_children():
+            self.queue_tree.delete(item)
 
-    def plot_results(self):
-        """Create visualizations of the simulation results"""
-        if not hasattr(self, 'results'):
-            raise ValueError("Run simulation first using run_simulation()")
+        # Add current queue items
+        temp_queue = queue.PriorityQueue()
+        while not self.queue.empty():
+            priority, timestamp, patient = self.queue.get()
+            wait_time = (datetime.now() - patient.arrival_time).total_seconds() / 60
+            self.queue_tree.insert("", tk.END, values=(
+                f"Patient {patient.id}",
+                f"{wait_time:.1f}",
+                "Emergency" if patient.priority == 3 else
+                "Urgent" if patient.priority == 2 else "Normal"
+            ))
+            temp_queue.put((priority, timestamp, patient))
 
-        # Create figure with subplots
-        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Hospital Queue Simulation Results', fontsize=16)
+        # Restore queue
+        while not temp_queue.empty():
+            self.queue.put(temp_queue.get())
 
-        # 1. Waiting Time Distribution
-        sns.histplot(data=self.results, x='waiting_time', bins=20, ax=axes[0, 0])
-        axes[0, 0].set_title('Distribution of Waiting Times')
-        axes[0, 0].set_xlabel('Waiting Time (minutes)')
-        axes[0, 0].set_ylabel('Count')
+        # Update statistics
+        self.stats_labels["Patients in Queue:"].configure(
+            text=str(self.queue.qsize()))
+        self.stats_labels["Current Patient:"].configure(
+            text=f"Patient {self.current_patient.id}" if self.current_patient else "None")
 
-        # 2. Queue Length Over Time
-        axes[0, 1].plot(self.results['arrival_time'], self.results['queue_length'])
-        axes[0, 1].set_title('Queue Length Over Time')
-        axes[0, 1].set_xlabel('Time')
-        axes[0, 1].set_ylabel('Number of Patients in Queue')
-        axes[0, 1].tick_params(axis='x', rotation=45)
+        if self.completed_patients:
+            wait_times = [(p.service_start_time - p.arrival_time).total_seconds() / 60
+                          for p in self.completed_patients]
+            avg_wait = sum(wait_times) / len(wait_times)
+            max_wait = max(wait_times)
+            self.stats_labels["Average Wait Time:"].configure(text=f"{avg_wait:.1f} min")
+            self.stats_labels["Max Wait Time:"].configure(text=f"{max_wait:.1f} min")
 
-        # 3. Service Time Distribution
-        sns.histplot(data=self.results, x='service_duration', bins=20, ax=axes[1, 0])
-        axes[1, 0].set_title('Distribution of Service Times')
-        axes[1, 0].set_xlabel('Service Time (minutes)')
-        axes[1, 0].set_ylabel('Count')
+        self.stats_labels["Completed Patients:"].configure(
+            text=str(len(self.completed_patients)))
 
-        # 4. Average Waiting Time by Hour
-        self.results['hour'] = self.results['arrival_time'].dt.hour
-        hourly_avg_wait = self.results.groupby('hour')['waiting_time'].mean()
-        hourly_avg_wait.plot(kind='bar', ax=axes[1, 1])
-        axes[1, 1].set_title('Average Waiting Time by Hour')
-        axes[1, 1].set_xlabel('Hour of Day')
-        axes[1, 1].set_ylabel('Average Waiting Time (minutes)')
+        # Update plot
+        self.update_plot()
 
-        plt.tight_layout()
-        plt.show()
+    def update_plot(self):
+        self.ax.clear()
+        if self.completed_patients:
+            wait_times = [(p.service_start_time - p.arrival_time).total_seconds() / 60
+                          for p in self.completed_patients]
+            self.ax.hist(wait_times, bins=20, alpha=0.75)
+            self.ax.set_xlabel("Waiting Time (minutes)")
+            self.ax.set_ylabel("Number of Patients")
+            self.ax.set_title("Distribution of Waiting Times")
+            self.canvas.draw()
 
-    def get_statistics(self):
-        """Calculate and return summary statistics"""
-        if not hasattr(self, 'results'):
-            raise ValueError("Run simulation first using run_simulation()")
-
-        stats = {
-            'average_waiting_time': self.results['waiting_time'].mean(),
-            'max_waiting_time': self.results['waiting_time'].max(),
-            'average_queue_length': self.results['queue_length'].mean(),
-            'max_queue_length': self.results['queue_length'].max(),
-            'total_patients': len(self.results),
-            'average_service_time': self.results['service_duration'].mean()
-        }
-
-        return stats
+    def run(self):
+        self.root.mainloop()
 
 
-# Example usage
 if __name__ == "__main__":
-    # Initialize simulation with parameters
-    simulation = HospitalQueueSimulation(
-        avg_arrival_rate=5,  # Average 5 patients arriving per hour
-        avg_service_rate=4,  # Can serve 4 patients per hour on average
-        num_hours=8  # 8-hour simulation
-    )
-
-    # Run simulation
-    results = simulation.run_simulation()
-
-    # Plot results
-    simulation.plot_results()
-
-    # Get and print statistics
-    stats = simulation.get_statistics()
-    print("\nSimulation Statistics:")
-    for key, value in stats.items():
-        print(f"{key.replace('_', ' ').title()}: {value:.2f}")
+    simulation = InteractiveHospitalQueue(avg_service_rate=4)
+    simulation.run()
