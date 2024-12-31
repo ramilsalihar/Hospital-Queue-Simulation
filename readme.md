@@ -65,6 +65,4 @@ The simulation uses Poisson distribution to model:
 # - Total patients served
 # - Average service time
 ```
-
-## License
-MIT License
+![Hospital Queue Simulation](demo.png)
